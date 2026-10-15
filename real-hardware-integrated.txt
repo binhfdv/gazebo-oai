@@ -1,0 +1,289 @@
+GAZEBO/ROS INTEGRATION ON REAL HARDWARE (PEAFOWL + SITHONIA) - DETAILED SUMMARY
+================================================================================
+
+GOAL
+----
+Port an existing, already-working ROS/Gazebo-over-5G setup (documented in
+the gazebo OAI integration chat) from a Kubernetes-based OAI deployment
+onto the bare-metal real-hardware stack built earlier in this engagement:
+  - gNB running on Peafowl, with a real Benetel RAN550 O-RU ("_c0")
+  - Core network (AMF/SMF/UPF/etc.) running as Docker containers on sithonia
+  - Real UE hardware on UP1 (Quectel modem, wwan0 interface)
+
+In the old setup, "UE" and "edge/DN" were Kubernetes pods, entered via
+`nsenter` using PIDs looked up through `crictl`/`cri-dockerd`. Neither pods
+nor that tooling exist in the new setup, so the whole integration had to be
+re-architected around real hardware (UP1) and plain Docker Compose
+containers (sithonia), communicating over the actual live cellular link
+instead of a cluster-internal network.
+
+
+ARCHITECTURE AND DESIGN DECISIONS
+----------------------------------
+
+1. Two separate Docker images instead of one, matching the two roles:
+   - UE side (runs ON UP1): full ROS Noetic + Gazebo + Jackal simulation
+     stack, since this is where the simulated robot(s) actually live.
+   - Edge side (runs on sithonia): a lighter ROS image whose only real job
+     is to host `roscore` (the ROS master) and provide CLI tools
+     (rostopic/rosbag/etc.) for controlling/monitoring the robots from the
+     core-network side.
+
+2. UE-side networking: `network_mode: host` in the UE's docker-compose.yml.
+   UP1 is real hardware, not a pod - the container just needs to share
+   UP1's own network stack directly to see `wwan0` (and its
+   dynamically-assigned 5G/PDU-session IP) with no namespace-entering
+   tricks needed at all.
+
+3. Edge-side networking: rather than a separate Kubernetes-pod-style
+   netns-entering mechanism, the edge ROS container was added as a NEW
+   SERVICE inside the EXISTING core docker-compose file
+   (binh/core_sithonia/docker-compose-basic-nrf.yaml), using
+   `network_mode: "container:duong-oai-ext-dn"` so it shares the exact
+   network namespace (and static IP, 192.168.80.135) of the already-working
+   `duong-oai-ext-dn` traffic-generator container.
+
+4. Made the edge ROS service OPTIONAL via Docker Compose `profiles`
+   (`profiles: ["ros"]`), rather than duplicating the whole core
+   docker-compose file into a second "with ROS" / "without ROS" variant.
+   This was a deliberate decision against an initial plan to keep two full
+   copies of the compose file: duplicating ~10 already-hand-tuned core NF
+   services (container renames, published ports, static IPs, custom
+   entrypoints) would risk silent drift between the two copies every time
+   either one got fixed/changed, and the two stacks couldn't even run
+   simultaneously anyway (they'd collide on the same static IPs/published
+   host ports), so the stated "flexibility" goal didn't actually require
+   duplication. `depends_on: oai-ext-dn: condition: service_healthy` was
+   also added so the ROS container waits for ext-dn's own health check
+   (which specifically confirms its route to the UE subnet exists) before
+   starting, instead of just waiting for the container to exist.
+
+5. Robot placement algorithm (for spawning N simulated Jackal robots),
+   agreed through planning before any code was written:
+   - No explicit positions given: full circle of NUM_ROBOTS robots evenly
+     spaced around the origin, radius = CIRCLE_RADIUS.
+   - Some positions given (fewer than NUM_ROBOTS): keep the given positions
+     exactly as specified; auto-fill the remaining robots on a small circle
+     around the CENTROID of the given positions (not the world origin),
+     with a minimum-spacing check that nudges the auto-fill radius outward
+     if a candidate position would land too close to an existing robot.
+   - As many or more positions given as NUM_ROBOTS: just use the first
+     NUM_ROBOTS given positions directly.
+   This is implemented in spawn_robots.py and configurable via env vars
+   (NUM_ROBOTS, ROBOT_POSITIONS as a JSON list, CIRCLE_RADIUS,
+   AUTO_FILL_RADIUS).
+
+
+FILES CREATED
+-------------
+
+binh/gazebo/ue/Dockerfile
+  Ubuntu 20.04 (Focal) base - required specifically because ROS Noetic's
+  apt repo targets Focal. Installs the full package set already validated
+  in installation_steps.md: ros-noetic-desktop, gazebo-ros-pkgs,
+  gazebo-ros-control, teleop-twist-keyboard, tf/tf2-tools, rqt-graph, rviz,
+  jackal-simulator/desktop/navigation, catkin-tools, rosdep, build-essential,
+  git, iproute2, iputils-ping. (This was briefly trimmed down for image-size
+  reasons - see "Image size optimization" below - then fully reverted back
+  to this full set on request, since the trimming was never actually the
+  cause of any bug found.)
+
+binh/gazebo/ue/entrypoint.sh
+  Container startup script, in order:
+    1. Set wwan0's MTU to 1400 (works around a confirmed PMTU blackhole -
+       see bug write-up below). Requires cap_add: NET_ADMIN.
+    2. Wait for wwan0 to actually have an IPv4 address (polls `ip addr
+       show`), since the PDU session may not be up yet when the container
+       starts.
+    3. Export ROS_IP (the UE's own dynamic PDU IP) and ROS_MASTER_URI
+       (pointing at the edge container's address).
+    4. Wait for the remote ROS master to be reachable (`rostopic list`).
+    5. Launch `jackal_gazebo jackal_world.launch gui:=false --screen` in
+       the background, capturing its PID. `--screen` forces every launched
+       node's stdout/stderr to the console (not just roslaunch's own
+       top-level summary) - without it, per-node output only goes into
+       log files under ~/.ros/log/, which made early debugging of Gazebo
+       startup effectively blind.
+    6. Wait for Gazebo's own spawn service (/gazebo/spawn_urdf_model) to
+       exist.
+    7. Run spawn_robots.py to compute placement and spawn/relocate robots.
+    8. Run cmd_bridge.py in the background, capturing its PID.
+    9. `wait` on both the Gazebo and bridge PIDs, so the container (PID 1)
+       stays alive for as long as they're running.
+
+binh/gazebo/ue/spawn_robots.py
+  Implements the placement algorithm above. For each robot: either relocates
+  the already-existing first robot ("jackal", spawned automatically by
+  jackal_world.launch itself) via /gazebo/set_model_state, or spawns
+  additional robots ("jackal_2", "jackal_3", ...) via `rosrun gazebo_ros
+  spawn_model`. Writes the final layout (topic name, model name, x/y/z) to
+  /tmp/robots_layout.json for cmd_bridge.py to read. Includes a
+  wait_for_model() guard (see bug write-up below) before attempting to
+  relocate the first robot.
+
+binh/gazebo/ue/cmd_bridge.py
+  Generalized version of the original five_jackal_cmd_bridge.py from
+  installation_steps.md - reads the dynamic layout file instead of
+  hardcoding exactly 5 robots/positions, so it works for however many
+  robots were actually spawned. Subscribes to /robotN/cmd_vel for each
+  robot in the layout, and drives the corresponding Gazebo model via
+  /gazebo/set_model_state using simple unicycle integration (same approach
+  as the original script).
+
+binh/gazebo/ue/docker-compose.yml
+  UE-side compose service: network_mode: host, cap_add: NET_ADMIN (for the
+  MTU fix), env vars for UE_IFACE/EDGE_IP/EDGE_PORT/NUM_ROBOTS/
+  CIRCLE_RADIUS/AUTO_FILL_RADIUS/ROBOT_POSITIONS. References a pre-built
+  image (ddocker122/gazebo-ue:latest) rather than `build: .`, after UP1 hit
+  Docker Hub connectivity problems (TLS handshake timeouts) - the image is
+  instead built elsewhere and transferred via `docker save`/`scp`/
+  `docker load` when a registry push/pull isn't available.
+
+binh/gazebo/edge/Dockerfile
+  Lighter image for the edge/sithonia side: ros-noetic-ros-base +
+  teleop-twist-keyboard + gazebo-msgs (message/service type definitions
+  ONLY, not the full gazebo-ros-pkgs, since Gazebo itself never actually
+  runs on this side - only roscore and rostopic/rosbag do).
+
+binh/gazebo/edge/entrypoint.sh
+  Detects its own IP (inherited from sharing ext-dn's network namespace,
+  so this is ext-dn's static IP, 192.168.80.135) and runs `roscore`
+  directly as the container's main process. Prints a ready-to-paste
+  `docker exec` command for interactive rostopic/rosbag work in a separate
+  shell, matching the existing manual workflow from installation_steps.md.
+
+binh/core_sithonia/docker-compose-basic-nrf.yaml (edited, not created)
+  Added the new edge ROS service (container name duong-ros-controller,
+  originally also referred to as "gazebo-edge") as described in the
+  networking/profiles design decisions above.
+
+
+BUGS FOUND AND FIXED, IN THE ORDER THEY CAME UP
+-------------------------------------------------
+
+1. Shell quoting mistakes in some docker exec commands (a stray closing
+   quote caused a multi-line heredoc-style command to only send an empty
+   string into the container, with the rest typed into the wrong shell
+   entirely). Corrected by re-pasting as a single properly-closed block.
+
+2. roslaunch's per-node output not appearing in `docker logs` at all -
+   only its own top-level parameter/node SUMMARY ever showed up, even once
+   Gazebo was supposedly starting. Root cause: roslaunch redirects each
+   launched node's stdout/stderr into per-node log files under
+   ~/.ros/log/ by default, not to the console, unless `--screen` is passed.
+   Added `--screen` to the roslaunch invocation in entrypoint.sh to fix
+   this (it was briefly removed and re-added during debugging).
+
+3. cmd_bridge.py crashed with `KeyError: 'yaw'` after the layout schema in
+   spawn_robots.py was intentionally renamed from "yaw" to "z" (same
+   semantic meaning - orientation angle - just a different field name).
+   Fixed by updating cmd_bridge.py's RobotState class and layout-reading
+   loop to read "z" instead of "yaw".
+
+4. Race condition in spawn_robots.py: the wait loop in entrypoint.sh only
+   confirms that the /gazebo/spawn_urdf_model SERVICE exists (i.e.
+   gzserver is up), not that jackal_world.launch's own internal,
+   asynchronous spawn of the first robot ("jackal") has actually finished.
+   This caused `rosservice call /gazebo/set_model_state` on "jackal" to
+   fail with "model does not exist" - silently, since the call used
+   check=False. Fixed by adding a wait_for_model() helper that polls
+   /gazebo/get_model_state for up to 30 seconds before attempting the
+   relocate, printing a clear warning on timeout instead of failing
+   silently.
+
+5. MAJOR BUG - PMTU/fragmentation blackhole on the GTP tunnel path. This
+   was the single biggest time sink in the whole integration. Symptom:
+   roslaunch would get all the way to "load_parameters starting..." and
+   then hang for minutes, with gzserver never actually starting and
+   /gazebo/spawn_urdf_model never appearing - looking exactly like a
+   hung/crashed process, but the roslaunch process itself stayed alive the
+   whole time.
+     Diagnosis process:
+       - Confirmed roslaunch was genuinely still alive (ps aux), and that
+         `rosparam list` on the remote master was climbing extremely
+         slowly (~8 parameters in 3 minutes, versus ~40-50 total expected
+         from the launch file) - far too slow to explain by latency alone
+         over a ~20ms-RTT link.
+       - Ruled out general link packet loss: iperf3 with small
+         (-l 1427 byte) UDP packets showed a clean 100 Mbit/s, 0% loss.
+       - Tested directly for an MTU-specific problem with "don't fragment"
+         pings: `ping -M do -s 1472` (1500 bytes total, standard Ethernet
+         MTU) showed 100% packet loss, while `ping -M do -s 500` (528
+         bytes total) was clean, 0% loss, ~20-27ms RTT.
+     Root cause: somewhere in the GTP tunnel path, packets near the
+     standard 1500-byte MTU are silently dropped instead of being properly
+     fragmented or triggering a "too big, resend smaller" ICMP response.
+     The large `robot_description` parameter (the full Jackal URDF XML,
+     much bigger than the other tiny parameters) was being sent as TCP
+     segments sized up to the interface's believed-safe MTU (1500,
+     matching the core's own `smf: ue_mtu: 1500` config) and simply
+     vanishing, forcing TCP into repeated exponential-backoff
+     retransmission timeouts (1s, 2s, 4s, 8s...) - which is exactly the
+     tens-of-seconds-per-parameter pattern observed, while all the other
+     small parameters sailed through quickly.
+     Fix: `ip link set wwan0 mtu 1400` - lowering the interface MTU makes
+     the kernel automatically clamp TCP segment sizes for every connection
+     on that interface, well below the blackhole threshold, without any
+     per-application workaround needed. Initially run as a one-off manual
+     host command; later automated into entrypoint.sh itself (configurable
+     via a new UE_MTU env var) specifically because a manual, undocumented
+     host-level fix would otherwise be silently lost on a reboot or
+     interface reset, reintroducing this exact bug with no obvious cause.
+     Required adding cap_add: NET_ADMIN to docker-compose.yml, since
+     network_mode: host alone does not grant permission to change
+     interface settings.
+
+6. Image-size optimization and revert: the UE and edge Dockerfiles were
+   both trimmed down at one point for size (ros-noetic-desktop ->
+   ros-base, dropping jackal-desktop/navigation/catkin-tools/rosdep/
+   build-essential/git on the UE side; gazebo-ros-pkgs -> gazebo-msgs on
+   the edge side). This trimming was later confirmed NOT to be the cause
+   of the PMTU-blackhole hang (a manual foreground roslaunch run with the
+   trimmed image still printed the full node SUMMARY correctly). The UE
+   Dockerfile's package set was fully reverted back to the original full
+   set on request; the edge Dockerfile's lighter gazebo-msgs-only set was
+   kept, since Gazebo genuinely never runs on that side.
+
+7. Even after the MTU fix, Gazebo's own internal spawn_model timeout
+   (built into jackal_world.launch's own urdf_spawner node) was observed
+   to take around 74 real seconds to spawn the first robot on UP1's modest
+   UP-board hardware - occasionally exceeding both its own timeout and our
+   30-second wait_for_model() check, producing a "jackal never showed up -
+   skipping relocate" warning. In practice, the model did eventually finish
+   appearing and ended up at the correct computed position anyway,
+   confirmed via a live /gazebo/get_model_state query - but the exact
+   mechanism of how it still reached the right position despite both wait
+   mechanisms timing out was not fully root-caused (most likely explanation:
+   accumulated docker logs output from more than one run/restart, with the
+   warning belonging to an earlier attempt).
+
+8. Separately, during the same period, a gNB crash was observed on Peafowl
+   right when the UE connected: fronthaul timing/frame-counter
+   discontinuities (`Jump in frame counter`, `Received Time doesn't
+   correspond to the time we think it is`) followed by repeated
+   `xran_process_rx_sym` section/PRB-mapping errors and an eventual
+   `Aborted`. This symptom pattern (low-level fronthaul timing/data
+   corruption occurring specifically once real uplink traffic starts
+   flowing) closely matches the TX2 hardware fault on the Benetel RAN550
+   O-RU ("_c0") that was confirmed much earlier in this engagement via
+   independent measurements (TXMeanPower, oru_dpd_stats showing
+   TX_SIGNAL_TOO_SMALL_ERROR and >100% EVM on TX2 specifically), but which
+   was never actually repaired - only worked around via other fixes. The
+   user later reported "the RAN works again" without a confirmed root
+   cause for that specific crash.
+
+
+CURRENT STATUS
+--------------
+
+The full pipeline has been confirmed working end-to-end at least once:
+  - UE container starts on UP1, applies the MTU fix, gets a PDU session IP
+    on wwan0, reaches the remote ROS master on sithonia.
+  - Gazebo launches headless, the first robot spawns (eventually) at the
+    correct circle-computed position, confirmed live via
+    /gazebo/get_model_state.
+  - A /cmd_vel command published from the edge container (sithonia) over
+    the real cellular link was confirmed to actually move the robot in the
+    simulation (position changed from (2.0, 0.0) to (0.32, 2.36)),
+    validating the complete control chain: edge -> cellular link ->
+    cmd_bridge.py -> Gazebo.

@@ -1,0 +1,34 @@
+# Runs on UP1. Deliberately network_mode: host - UP1 is real hardware,
+# not a pod, so the container just needs to share UP1's own network
+# stack to see wwan0 (and its dynamically-assigned 5G IP) directly.
+# No namespace-entering needed, unlike the old K8s/pod setup.
+services:
+  gazebo-ue:
+    container_name: gazebo-ue
+    image: ddocker122/gazebo-ue:latest
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    # cap_add: NET_ADMIN alone isn't enough for `ip link set mtu` here -
+    # Docker's default AppArmor profile (docker-default) separately blocks
+    # netlink interface-configuration ops even with the capability granted,
+    # which is why it was failing with "Operation not permitted" (EPERM,
+    # not an invalid-value error) despite the interface's maxmtu being
+    # plenty high. Lifting AppArmor confinement is what actually allows it.
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      - UE_IFACE=wwan0
+      - EDGE_IP=192.168.80.135
+      - EDGE_PORT=11311
+      # Unique per UE when running more than one against the same shared
+      # roscore (ue2, ue3, ... for additional UEs) - leave unset for a
+      # single-UE deployment. See binh/real-hardware-integrated.txt for
+      # why this is needed and what's still unverified about it.
+      - UE_NAMESPACE=ue1
+      - NUM_ROBOTS=1
+      - CIRCLE_RADIUS=2.0
+      - AUTO_FILL_RADIUS=1.5
+      # Optional: give some robots explicit positions; any remaining
+      # robots (up to NUM_ROBOTS) get auto-filled near their centroid.
+      # - ROBOT_POSITIONS=[{"x":1,"y":2},{"x":-1,"y":3}]

@@ -1,0 +1,198 @@
+# SPDX-License-Identifier: MIT
+# on Peafowl
+# sudo ip route add 192.168.80.128/26 via 172.21.16.117
+
+# copy database /home/lapdk/workspace/oai-eurecom-setups-tutorials/helm-charts/oai-5g-eurecom/mysql/initialization/oai_db-basic.sql
+# to database in sithonia
+
+services:
+    mysql:
+        container_name: "duong-mysql"
+        image: mysql:9.6.0
+        volumes:
+            - ./database/peafowl_oai_db-basic.sql:/docker-entrypoint-initdb.d/oai_db.sql
+            - ./healthscripts/mysql-healthcheck2.sh:/tmp/mysql-healthcheck.sh
+        environment:
+            - TZ=Europe/Paris
+            - MYSQL_DATABASE=oai_db
+            - MYSQL_USER=test
+            - MYSQL_PASSWORD=test
+            - MYSQL_ROOT_PASSWORD=linux
+        healthcheck:
+            test: /bin/bash -c "/tmp/mysql-healthcheck.sh"
+            interval: 10s
+            timeout: 5s
+            retries: 30
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+#                ipv4_address: 192.168.70.131
+    oai-udr:
+        container_name: "duong-oai-udr"
+        image: oaisoftwarealliance/oai-udr:v2.2.1
+        expose:
+            - 80/tcp
+            - 8080/tcp
+        volumes:
+            - ./conf/basic_nrf_config.yaml:/openair-udr/etc/config.yaml
+        environment:
+            - TZ=Europe/Paris
+        depends_on:
+            - mysql
+            - oai-nrf
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+#                ipv4_address: 192.168.70.136
+    oai-udm:
+        container_name: "duong-oai-udm"
+        image: oaisoftwarealliance/oai-udm:v2.2.1
+        expose:
+            - 80/tcp
+            - 8080/tcp
+        volumes:
+            - ./conf/basic_nrf_config.yaml:/openair-udm/etc/config.yaml
+        environment:
+            - TZ=Europe/Paris
+        depends_on:
+            - oai-nrf
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+#                ipv4_address: 192.168.70.137
+    oai-ausf:
+        container_name: "duong-oai-ausf"
+        image: oaisoftwarealliance/oai-ausf:v2.2.1
+        expose:
+            - 80/tcp
+            - 8080/tcp
+        volumes:
+            - ./conf/basic_nrf_config.yaml:/openair-ausf/etc/config.yaml
+        environment:
+            - TZ=Europe/Paris
+        depends_on:
+            - oai-nrf
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+#                ipv4_address: 192.168.70.138
+    oai-nrf:
+        container_name: "duong-oai-nrf"
+        image: oaisoftwarealliance/oai-nrf:v2.2.1
+        expose:
+            - 80/tcp
+            - 8080/tcp
+        volumes:
+            - ./conf/basic_nrf_config.yaml:/openair-nrf/etc/config.yaml
+        environment:
+            - TZ=Europe/Paris
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+#                ipv4_address: 192.168.70.130
+    oai-amf:
+        container_name: "duong-oai-amf"
+        image: oaisoftwarealliance/oai-amf:v2.2.1
+        expose:
+            - 80/tcp
+            - 8080/tcp
+            - 38412/sctp
+        ports:
+            - "172.21.16.117:38412:38412/sctp"
+        volumes:
+            - ./conf/basic_nrf_config.yaml:/openair-amf/etc/config.yaml
+        environment:
+            - TZ=Europe/Paris
+        depends_on:
+            - oai-nrf
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+#              ipv4_address: 192.168.80.132
+    oai-smf:
+        container_name: "duong-oai-smf"
+        image: oaisoftwarealliance/oai-smf:v2.2.1
+        expose:
+            - 80/tcp
+            - 8080/tcp
+            - 8805/udp
+        volumes:
+            - ./conf/basic_nrf_config.yaml:/openair-smf/etc/config.yaml
+        environment:
+            - TZ=Europe/Paris
+        depends_on:
+            - oai-nrf
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+#                ipv4_address: 192.168.70.133
+    oai-upf:
+        container_name: "duong-oai-upf"
+        image: oaisoftwarealliance/oai-upf:v2.2.1
+        expose:
+            - 2152/udp
+            - 8805/udp
+        ports:
+            - "172.21.16.117:2152:2152/udp"
+        volumes:
+            - ./conf/basic_nrf_config.yaml:/openair-upf/etc/config.yaml
+        environment:
+            - TZ=Europe/Paris
+        depends_on:
+            - oai-nrf
+        cap_add:
+            - NET_ADMIN
+            - SYS_ADMIN
+        cap_drop:
+            - ALL
+        privileged: true
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+                ipv4_address: 192.168.80.134
+    oai-ext-dn:
+        privileged: true
+        init: true
+        container_name: duong-oai-ext-dn
+        image: oaisoftwarealliance/trf-gen-cn5g:latest
+        entrypoint: /bin/bash -c \
+              "ip route add 12.1.1.0/24 via 192.168.80.134 dev eth0; ip route; iperf3 -s -D; sleep infinity"
+        command: ["/bin/bash", "-c", "trap : SIGTERM SIGINT; sleep infinity & wait"]
+        environment:
+            - UPF_FQDN=oai-upf
+            - UE_NETWORK=12.1.1.0/24
+            - USE_FQDN=yes
+        healthcheck:
+            test: /bin/bash -c "ip r | grep 12.1.1"
+            interval: 10s
+            timeout: 5s
+            retries: 5
+        networks:
+            public_net:
+# For CI purposes, we are keeping the line commented
+                ipv4_address: 192.168.80.135
+
+    # Optional ROS/Gazebo edge node. Off by default; bring the whole
+    # stack up with the "ros" profile to include it:
+    #   docker compose -p duong-oai-core -f docker-compose-basic-nrf.yaml --profile ros up -d
+    # Expects the binh/gazebo/edge/ folder (Dockerfile + entrypoint.sh)
+    # copied here as ./gazebo-edge before building.
+    ros-controller:
+        profiles: ["ros"]
+        container_name: "duong-ros-controller"
+        image: ddocker122/ros-controller:latest
+        network_mode: "container:duong-oai-ext-dn"
+        depends_on:
+            oai-ext-dn:
+                condition: service_healthy
+
+networks:
+    public_net:
+        driver: bridge
+        name: duong-oai-public-net
+        ipam:
+            config:
+                - subnet: 192.168.80.128/26
+        driver_opts:
+            com.docker.network.bridge.name: "duong-oai"
+            com.docker.network.bridge.gateway_mode_ipv4: "nat-unprotected"
